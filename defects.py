@@ -1,307 +1,448 @@
+"""
+Plume-forming model with:
+  - Polar (+/-1) defect detection from flow director
+  - Kinetic energy diagnostics
+  - Defect density and correlation analysis (scatter + lagged xcorr)
+  
+System:
+  n_t + div(u n) = Δ n - μ0 γ0 γ ∂_y n - χ0 div(n ∇c)
+  c_t + div(u c) = α Δ c - β n c
+  ν u_xx + u_yy + (ν-1) u_xy - u + χ1 c_x - (Pe/(1+n)^2) n_x = 0
+  (ν-1) u_xy + ν v_yy + v_xx - v + χ1 c_y
+       - (Pe/(1+n)^2) n_y - μ0 γ0 n = 0
+
+Numerical method: 2D pseudo-spectral (FFT), periodic BCs,
+IMEX (diffusion implicit; advection/chemotaxis/reaction explicit).
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from scipy import interpolate
+import warnings
 
+# ==================== Parameters ====================
+Lx = 50
+Ly = 50
+Nx = 256 * 2
+Ny = 256 * 2
+dx = Lx / Nx
+dy = Ly / Ny
 
-def wrap_pi(a):
-    return np.arctan2(np.sin(a), np.cos(a))
+dt = 0.01
+tFinal = 200
+plotEvery = 1000  # visualization/tracking interval
+defectEvery = 1   # compute defects & rhoD every this many steps
 
+alpha = 0.25
+beta = 1.0
+chi0 = 10.0
+Pe = 1.2
+mu0 = 5e-2
+nu = 4.0
+gamma0 = 7e-1
+gamma = 8e-1
+chi1 = chi0 * gamma
 
-def detect_winding_defects(theta_field, x, y):
-    theta2 = 2.0 * theta_field
+clipNneg = True
+dealise = True
 
-    t00 = theta2[:-1, :-1]
-    t10 = theta2[:-1, 1:]
-    t11 = theta2[1:, 1:]
-    t01 = theta2[1:, :-1]
+np.random.seed(2)
 
-    d1 = wrap_pi(t10 - t00)
-    d2 = wrap_pi(t11 - t10)
-    d3 = wrap_pi(t01 - t11)
-    d4 = wrap_pi(t00 - t01)
+# ==================== Local functions (defined first) ====================
 
-    charge = (d1 + d2 + d3 + d4) / (4.0 * np.pi)
+def detect_winding_defects_polar(thetaField, u, v, x, y):
+    """
+    Detect integer (+/-1) POLAR topological defects from flow-defined director.
+    q = (1/2π) ∮ dθ  around each plaquette
+    """
+    speed = np.sqrt(u**2 + v**2)
+    theta = thetaField.copy()
+    theta[speed < 1e-4] = np.nan  # mask ill-defined director
 
-    mask = np.abs(charge) > 0.25
-    q_raw = charge[mask]
-    q_def = 0.5 * np.sign(q_raw)
+    t00 = theta[:-1, :-1]
+    t10 = theta[:-1, 1:]
+    t11 = theta[1:, 1:]
+    t01 = theta[1:, :-1]
+
+    valid = np.isfinite(t00) & np.isfinite(t10) & np.isfinite(t11) & np.isfinite(t01)
+
+    def wrap(a):
+        return np.arctan2(np.sin(a), np.cos(a))
+
+    d1 = wrap(t10 - t00)
+    d2 = wrap(t11 - t10)
+    d3 = wrap(t01 - t11)
+    d4 = wrap(t00 - t01)
+    winding = (d1 + d2 + d3 + d4) / (2 * np.pi)
+
+    mask = valid & (np.abs(winding) > 0.75)
+    qDef = np.sign(winding[mask]) * np.round(np.abs(winding[mask])).astype(int)
 
     xc = x[:-1] + 0.5 * (x[1] - x[0])
     yc = y[:-1] + 0.5 * (y[1] - y[0])
-    xc_grid, yc_grid = np.meshgrid(xc, yc)
+    XC, YC = np.meshgrid(xc, yc)
 
-    x_def = xc_grid[mask]
-    y_def = yc_grid[mask]
-    return x_def, y_def, q_def
+    xDef = XC[mask]
+    yDef = YC[mask]
+
+    return xDef, yDef, qDef
 
 
-def update_defect_tracks(tracks, next_track_id, x_def, y_def, q_def, t_now, frame_idx, max_dist, max_gap):
-    used_track = np.zeros(len(tracks), dtype=bool)
+def update_defect_tracks(tracks, nextTrackId, xDef, yDef, qDef, tNow, frameIdx, maxDist, maxGap):
+    """
+    Nearest-neighbor tracking with sign consistency.
+    Tracked only at plotted frames.
+    """
+    usedTrack = [False] * len(tracks)
 
-    for i in range(len(x_def)):
-        this_sign = q_def[i]
-        best_track = -1
-        best_dist = np.inf
+    for i in range(len(xDef)):
+        thisSign = qDef[i]
+        bestTrack = -1
+        bestDist = np.inf
 
         for k in range(len(tracks)):
-            if used_track[k]:
+            if usedTrack[k]:
                 continue
-            if tracks[k]["sign"] != this_sign:
+            if tracks[k]['sign'] != thisSign:
                 continue
-            if frame_idx - tracks[k]["lastFrame"] > max_gap:
+            if frameIdx - tracks[k]['lastFrame'] > maxGap:
                 continue
 
-            dxk = x_def[i] - tracks[k]["x"][-1]
-            dyk = y_def[i] - tracks[k]["y"][-1]
-            dist = np.hypot(dxk, dyk)
+            dist = np.hypot(xDef[i] - tracks[k]['x'][-1], yDef[i] - tracks[k]['y'][-1])
+            if dist < bestDist:
+                bestDist = dist
+                bestTrack = k
 
-            if dist < best_dist:
-                best_dist = dist
-                best_track = k
-
-        if best_track >= 0 and best_dist <= max_dist:
-            tracks[best_track]["x"].append(float(x_def[i]))
-            tracks[best_track]["y"].append(float(y_def[i]))
-            tracks[best_track]["t"].append(float(t_now))
-            tracks[best_track]["lastFrame"] = int(frame_idx)
-            used_track[best_track] = True
+        if bestTrack >= 0 and bestDist <= maxDist:
+            tracks[bestTrack]['x'].append(xDef[i])
+            tracks[bestTrack]['y'].append(yDef[i])
+            tracks[bestTrack]['t'].append(tNow)
+            tracks[bestTrack]['lastFrame'] = frameIdx
+            usedTrack[bestTrack] = True
         else:
-            tracks.append(
-                {
-                    "id": int(next_track_id),
-                    "sign": float(this_sign),
-                    "x": [float(x_def[i])],
-                    "y": [float(y_def[i])],
-                    "t": [float(t_now)],
-                    "lastFrame": int(frame_idx),
-                }
-            )
-            used_track = np.append(used_track, True)
-            next_track_id += 1
+            newTrack = {
+                'id': nextTrackId,
+                'sign': thisSign,
+                'x': [xDef[i]],
+                'y': [yDef[i]],
+                't': [tNow],
+                'lastFrame': frameIdx
+            }
+            tracks.append(newTrack)
+            usedTrack.append(True)
+            nextTrackId += 1
 
-    return tracks, next_track_id
+    return tracks, nextTrackId
 
 
-def run_simulation():
-    Lx = 50
-    Ly = 50
-    Nx = 256 * 2
-    Ny = 256 * 2
+def xcorr_coeff(a, b, maxLag):
+    """
+    Cross-correlation normalized to coefficient (no toolbox).
+    Returns C(lag) for lags = -maxLag:maxLag.
+    """
+    a = np.asarray(a).flatten()
+    b = np.asarray(b).flatten()
+    a = a - np.mean(a)
+    b = b - np.mean(b)
 
-    dt = 0.01
-    t_final = 200
-    plot_every = 1000
+    Na = len(a)
+    lags = np.arange(-maxLag, maxLag + 1)
+    C = np.zeros(len(lags))
 
-    alpha = 0.25
-    beta = 1
-    chi0 = 10
-    Pe = 1.2
-    mu0 = 0.05
-    nu = 4
-    gamma0 = 0.7
-    gamma = 0.8
-    chi1 = chi0 * gamma
+    den = np.sqrt(np.sum(a**2) * np.sum(b**2))
+    if den == 0:
+        return C, lags
 
-    clip_n_neg = True
-    dealise = True
+    for ii, L in enumerate(lags):
+        if L >= 0:
+            aa = a[:Na - L]
+            bb = b[L:Na]
+        else:
+            L = -L
+            aa = a[L:Na]
+            bb = b[:Na - L]
+        C[ii] = np.sum(aa * bb) / den
 
-    rng = np.random.default_rng(2)
+    return C, lags
 
-    x = np.linspace(0, Lx, Nx, endpoint=False)
-    y = np.linspace(0, Ly, Ny, endpoint=False)
-    X, Y = np.meshgrid(x, y)
+# ==================== Grids & Fourier operators ====================
+x = np.linspace(0, Lx, Nx, endpoint=False)
+y = np.linspace(0, Ly, Ny, endpoint=False)
+X, Y = np.meshgrid(x, y)
 
-    kx = (2 * np.pi / Lx) * np.concatenate((np.arange(0, Nx // 2), np.arange(-Nx // 2, 0)))
-    ky = (2 * np.pi / Ly) * np.concatenate((np.arange(0, Ny // 2), np.arange(-Ny // 2, 0)))
-    KX, KY = np.meshgrid(kx, ky)
-    K2 = KX**2 + KY**2
+kx = (2 * np.pi / Lx) * np.concatenate([np.arange(Nx // 2), np.arange(-Nx // 2, 0)])
+ky = (2 * np.pi / Ly) * np.concatenate([np.arange(Ny // 2), np.arange(-Ny // 2, 0)])
+KX, KY = np.meshgrid(kx, ky)
+K2 = KX**2 + KY**2
 
-    den_n = 1 + dt * K2
-    den_c = 1 + dt * alpha * K2
+denN = 1 + dt * K2
+denC = 1 + dt * alpha * K2
+
+if dealise:
+    kx_cut = (2 / 3) * np.max(np.abs(kx))
+    ky_cut = (2 / 3) * np.max(np.abs(ky))
+    dealiasMask = (np.abs(KX) <= kx_cut) & (np.abs(KY) <= ky_cut)
+else:
+    dealiasMask = np.ones_like(KX, dtype=bool)
+
+# ==================== Initial conditions ====================
+n0 = 1
+n = n0 + 0.02 * np.cos(KX * X + KY * Y)
+c0 = 1.0
+c = c0 + 0.02 * np.cos(KX * X + KY * Y)
+
+u = np.zeros((Ny, Nx))
+v = np.zeros((Ny, Nx))
+
+# ==================== Diagnostics storage ====================
+nSteps = int(np.ceil(tFinal / dt))
+time_vec = np.arange(1, nSteps + 1) * dt
+
+Ek_time = np.zeros(nSteps)
+rhoD_time = np.full(nSteps, np.nan)
+Ndef_time = np.full(nSteps, np.nan)
+
+# ==================== Visualization setup ====================
+quiverSub = max(1, round(Nx / 30))
+Xq = X[::quiverSub, ::quiverSub]
+Yq = Y[::quiverSub, ::quiverSub]
+
+fig = plt.figure(figsize=(14, 10), facecolor='w')
+gs = GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.3)
+
+ax1 = fig.add_subplot(gs[0, 0])
+h_n = ax1.imshow(n, extent=[x[0], x[-1], y[0], y[-1]], origin='lower', cmap='turbo')
+ax1.set_aspect('equal')
+plt.colorbar(h_n, ax=ax1)
+ax1.set_title('n(x,y,t)')
+q4 = ax1.quiver(Xq, Yq, np.zeros_like(Xq), np.zeros_like(Yq), scale=25)
+
+ax2 = fig.add_subplot(gs[0, 1])
+h_c = ax2.imshow(c, extent=[x[0], x[-1], y[0], y[-1]], origin='lower', cmap='turbo')
+ax2.set_aspect('equal')
+plt.colorbar(h_c, ax=ax2)
+ax2.set_title('c(x,y,t)')
+
+ax3 = fig.add_subplot(gs[1, 0])
+Q = np.zeros_like(n)
+h_Q = ax3.imshow(Q, extent=[x[0], x[-1], y[0], y[-1]], origin='lower', cmap='turbo')
+ax3.set_aspect('equal')
+plt.colorbar(h_Q, ax=ax3)
+ax3.set_title('Q(x,y,t)')
+q3 = ax3.quiver(Xq, Yq, np.zeros_like(Xq), np.zeros_like(Yq), scale=25)
+
+ax4 = fig.add_subplot(gs[1, 1])
+thetaField = np.zeros_like(n)
+h_theta = ax4.imshow(thetaField, extent=[x[0], x[-1], y[0], y[-1]], origin='lower', cmap='hsv', vmin=0, vmax=2*np.pi)
+ax4.set_aspect('equal')
+plt.colorbar(h_theta, ax=ax4)
+ax4.set_title('Director θ + defects')
+q = ax4.quiver(Xq, Yq, np.zeros_like(Xq), np.zeros_like(Yq), scale=20)
+hPlus = ax4.scatter([], [], s=36, c='r', edgecolors='k', zorder=5)
+hMinus = ax4.scatter([], [], s=36, c='c', edgecolors='k', zorder=5)
+trackLineHandles = []
+
+plt.ion()
+plt.pause(0.001)
+
+# Defect-core tracking state
+tracks = []
+nextTrackId = 1
+trackMaxDist = 1.5
+trackMaxGap = 2
+frameCount = 0
+
+# ==================== Time integration loop ====================
+for step in range(nSteps):
+    # ---- FFTs ----
+    N_hat = np.fft.fft2(n)
+    C_hat = np.fft.fft2(c)
+
+    # ---- Gradients ----
+    ny = np.real(np.fft.ifft2(1j * KY * N_hat))
+    cx = np.real(np.fft.ifft2(1j * KX * C_hat))
+    cy = np.real(np.fft.ifft2(1j * KY * C_hat))
+
+    # ---- Flow solve in Fourier space ----
+    S_hat = np.fft.fft2(Pe / (1 + n))
+    U_hat = (1j * KX * (chi1 * C_hat + S_hat) / (1 + nu * K2) +
+             mu0 * gamma0 * KX * KY * (nu - 1) * N_hat / ((1 + K2) * (1 + nu * K2)))
+    V_hat = (1j * KY * (chi1 * C_hat + S_hat) / (1 + nu * K2) -
+             mu0 * gamma0 * (1 + nu * KX**2 + KY**2) * N_hat / ((1 + K2) * (1 + nu * K2)))
+
+    U_hat[~np.isfinite(U_hat)] = 0
+    V_hat[~np.isfinite(V_hat)] = 0
 
     if dealise:
-        kx_cut = (2 / 3) * np.max(np.abs(kx))
-        ky_cut = (2 / 3) * np.max(np.abs(ky))
-        dealias_mask = (np.abs(KX) <= kx_cut) & (np.abs(KY) <= ky_cut)
+        U_hat = U_hat * dealiasMask
+        V_hat = V_hat * dealiasMask
+
+    u = np.real(np.fft.ifft2(U_hat))
+    v = np.real(np.fft.ifft2(V_hat))
+
+    # ---- Kinetic energy ----
+    Ek_time[step] = dx * dy * np.sum(0.5 * (u**2 + v**2))
+
+    # ---- RHS for n and c ----
+    div_un = np.real(np.fft.ifft2(1j * KX * np.fft.fft2(u * n) + 1j * KY * np.fft.fft2(v * n)))
+    div_uc = np.real(np.fft.ifft2(1j * KX * np.fft.fft2(u * c) + 1j * KY * np.fft.fft2(v * c)))
+    nablan = np.real(np.fft.ifft2(-K2 * N_hat))
+    nablac = np.real(np.fft.ifft2(-K2 * C_hat))
+
+    div_n_gradc = np.real(np.fft.ifft2(1j * KX * np.fft.fft2(n * cx) + 1j * KY * np.fft.fft2(n * cy)))
+    drift_n = -(mu0 * gamma0 * gamma) * ny
+    RHSn = nablan - div_un + drift_n - chi0 * div_n_gradc
+    RHSc = alpha * nablac - div_uc - beta * (n * c) + beta * c
+
+    # ---- Dealias nonlinear terms ----
+    if dealise:
+        RHSn_hat = np.fft.fft2(RHSn) * dealiasMask
+        RHSc_hat = np.fft.fft2(RHSc) * dealiasMask
     else:
-        dealias_mask = np.ones_like(KX, dtype=bool)
+        RHSn_hat = np.fft.fft2(RHSn)
+        RHSc_hat = np.fft.fft2(RHSc)
 
-    n0 = 1.0
-    n = n0 + 0.02 * rng.standard_normal((Ny, Nx))
-    n = np.maximum(n, 0)
+    # ---- IMEX update ----
+    n = np.real(np.fft.ifft2((N_hat + dt * RHSn_hat) / denN))
+    c = np.real(np.fft.ifft2((C_hat + dt * RHSc_hat) / denC))
 
-    c0 = 1.0
-    c = c0 + 0.02 * rng.standard_normal((Ny, Nx))
+    if clipNneg:
+        n = np.maximum(n, 0)
 
-    u = np.zeros((Ny, Nx))
-    v = np.zeros((Ny, Nx))
+    # ---- Defects & defect density ----
+    if (step + 1) % defectEvery == 0:
+        thetaField = np.arctan2(v, u)
+        xDef_all, yDef_all, qDef_all = detect_winding_defects_polar(thetaField, u, v, x, y)
 
-    quiver_sub = max(1, int(round(Nx / 30)))
-    Xq = X[::quiver_sub, ::quiver_sub]
-    Yq = Y[::quiver_sub, ::quiver_sub]
+        Ndef_time[step] = len(qDef_all)
+        rhoD_time[step] = Ndef_time[step] / (Lx * Ly)
 
-    plt.ion()
-    fig, axes = plt.subplots(2, 2, figsize=(12, 9), constrained_layout=True)
-    ax1, ax2 = axes[0, 0], axes[0, 1]
-    ax3, ax4 = axes[1, 0], axes[1, 1]
+    # ---- Visualization & tracking ----
+    if (step + 1) % plotEvery == 0 or step == 0 or step == nSteps - 1:
+        frameCount += 1
+        tNow = (step + 1) * dt
 
-    h_n = ax1.imshow(n, origin="lower", extent=[0, Lx, 0, Ly], cmap="turbo", aspect="equal")
-    fig.colorbar(h_n, ax=ax1)
-    ax1.set_title("n(x,y,t)")
-    q4 = ax1.quiver(Xq, Yq, np.zeros_like(Xq), np.zeros_like(Yq), color="k")
+        # Compute defects if not computed this step
+        if (step + 1) % defectEvery != 0:
+            thetaField = np.arctan2(v, u)
+            xDef_all, yDef_all, qDef_all = detect_winding_defects_polar(thetaField, u, v, x, y)
+            Ndef_time[step] = len(qDef_all)
+            rhoD_time[step] = Ndef_time[step] / (Lx * Ly)
 
-    h_c = ax2.imshow(c, origin="lower", extent=[0, Lx, 0, Ly], cmap="turbo", aspect="equal")
-    fig.colorbar(h_c, ax=ax2)
-    ax2.set_title("c(x,y,t)")
+        # Track defects
+        tracks, nextTrackId = update_defect_tracks(
+            tracks, nextTrackId, xDef_all, yDef_all, qDef_all,
+            tNow, frameCount, trackMaxDist, trackMaxGap)
 
-    vort = np.zeros_like(n)
-    h_vort = ax3.imshow(vort, origin="lower", extent=[0, Lx, 0, Ly], cmap="turbo", aspect="equal")
-    fig.colorbar(h_vort, ax=ax3)
-    ax3.set_title("W(x,y,t)")
-    q3 = ax3.quiver(Xq, Yq, np.zeros_like(Xq), np.zeros_like(Yq), color="k")
+        # Update plots
+        h_n.set_data(n)
+        ax1.set_title(f'n(x,y,t), t = {tNow:.2f}')
+        q4.set_UVC(u[::quiverSub, ::quiverSub], v[::quiverSub, ::quiverSub])
 
-    theta_field = np.zeros_like(n)
-    h_theta = ax4.imshow(theta_field, origin="lower", extent=[0, Lx, 0, Ly], cmap="hsv", aspect="equal", vmin=0, vmax=np.pi)
-    fig.colorbar(h_theta, ax=ax4)
-    ax4.set_title("Director θ(x,y,t) + defects")
-    q = ax4.quiver(Xq, Yq, np.zeros_like(Xq), np.zeros_like(Yq), color="k")
-    h_plus = ax4.scatter([], [], s=36, c="r", edgecolors="k")
-    h_minus = ax4.scatter([], [], s=36, c="c", edgecolors="k")
-    track_line_handles = []
+        h_c.set_data(c)
+        ax2.set_title(f'c(x,y,t), t = {tNow:.2f}')
 
-    tracks = []
-    next_track_id = 1
-    track_max_dist = 1.5
-    track_max_gap = 2
-    frame_count = 0
+        # Vorticity and Okubo-Weiss parameter
+        ux = np.real(np.fft.ifft2(1j * KX * np.fft.fft2(u)))
+        vx = np.real(np.fft.ifft2(1j * KX * np.fft.fft2(v)))
+        uy = np.real(np.fft.ifft2(1j * KY * np.fft.fft2(u)))
+        vy = np.real(np.fft.ifft2(1j * KY * np.fft.fft2(v)))
+        vort = vx - uy
+        sn = ux - vy
+        ss = vx + uy
+        Q = sn**2 + ss**2 - vort**2
+        h_Q.set_data(Q)
+        vmax = np.max(np.abs(vort))
+        if vmax > 0:
+            h_Q.set_clim(-vmax, vmax)
+        ax3.set_title(f'Q(x,y,t), t={tNow:.2f}, E_k={Ek_time[step]:.3e}')
+        q3.set_UVC(u[::quiverSub, ::quiverSub], v[::quiverSub, ::quiverSub])
 
-    n_steps = int(np.ceil(t_final / dt))
+        # Director & defects
+        h_theta.set_data(np.mod(thetaField, 2 * np.pi))
+        ax4.set_title(f'θ + defects, t={tNow:.2f}, ρ_d={rhoD_time[step]:.3e}')
 
-    for step in range(1, n_steps + 1):
-        N_hat = np.fft.fft2(n)
-        C_hat = np.fft.fft2(c)
+        thetaSub = thetaField[::quiverSub, ::quiverSub]
+        q.set_UVC(np.cos(thetaSub), np.sin(thetaSub))
 
-        nx = np.real(np.fft.ifft2(1j * KX * N_hat))
-        ny = np.real(np.fft.ifft2(1j * KY * N_hat))
-        cx = np.real(np.fft.ifft2(1j * KX * C_hat))
-        cy = np.real(np.fft.ifft2(1j * KY * C_hat))
+        posMask = qDef_all > 0
+        negMask = qDef_all < 0
+        hPlus.set_offsets(np.column_stack([xDef_all[posMask], yDef_all[posMask]]))
+        hMinus.set_offsets(np.column_stack([xDef_all[negMask], yDef_all[negMask]]))
 
-        S_hat = np.fft.fft2(Pe / (1 + n))
-        U_hat = 1j * KX * (chi1 * C_hat + S_hat) / (1 + nu * K2) + mu0 * gamma0 * KX * KY * (nu - 1) * N_hat / ((1 + K2) * (1 + nu * K2))
-        V_hat = 1j * KY * (chi1 * C_hat + S_hat) / (1 + nu * K2) - mu0 * gamma0 * (1 + nu * KX**2 + KY**2) * N_hat / ((1 + K2) * (1 + nu * K2))
+        # Remove old track lines
+        for line in trackLineHandles:
+            line.remove()
+        trackLineHandles = []
 
-        U_hat[~np.isfinite(U_hat)] = 0
-        V_hat[~np.isfinite(V_hat)] = 0
+        for track in tracks:
+            if len(track['x']) > 1:
+                lineColor = 'r' if track['sign'] > 0 else 'c'
+                line, = ax4.plot(track['x'], track['y'], '-', color=lineColor, linewidth=1.1)
+                trackLineHandles.append(line)
 
-        if dealise:
-            U_hat *= dealias_mask
-            V_hat *= dealias_mask
+        plt.pause(0.001)
 
-        u = np.real(np.fft.ifft2(U_hat))
-        v = np.real(np.fft.ifft2(V_hat))
+defectTracks = tracks
 
-        un = u * n
-        vn = v * n
-        uc = u * c
-        vc = v * c
+# ==================== Post-run correlation analysis ====================
+# Clean NaNs if defectEvery > 1
+rhoD = rhoD_time.copy()
+Ndef = Ndef_time.copy()
 
-        div_un = np.real(np.fft.ifft2(1j * KX * np.fft.fft2(un) + 1j * KY * np.fft.fft2(vn)))
-        div_uc = np.real(np.fft.ifft2(1j * KX * np.fft.fft2(uc) + 1j * KY * np.fft.fft2(vc)))
-        nabla_n = np.real(np.fft.ifft2(-K2 * N_hat))
-        nabla_c = np.real(np.fft.ifft2(-K2 * C_hat))
+if np.any(np.isnan(rhoD)):
+    idx = np.where(~np.isnan(rhoD))[0]
+    if len(idx) >= 2:
+        f = interpolate.interp1d(time_vec[idx], rhoD[idx], kind='linear', fill_value='extrapolate')
+        rhoD = f(time_vec)
+    else:
+        warnings.warn('Not enough defect samples to interpolate. Set defectEvery=1.')
 
-        n_cx = n * cx
-        n_cy = n * cy
-        div_n_gradc = np.real(np.fft.ifft2(1j * KX * np.fft.fft2(n_cx) + 1j * KY * np.fft.fft2(n_cy)))
+# 1) Time series overlay
+fig1, ax = plt.subplots(figsize=(10, 6), facecolor='w')
+ax1_twin = ax
+ax2_twin = ax.twinx()
 
-        drift_n = -(mu0 * gamma0 * gamma) * ny
+line1 = ax1_twin.plot(time_vec, Ek_time, 'k', linewidth=1.4, label='$E_k$')
+ax1_twin.set_ylabel('Kinetic energy $E_k$', color='k')
+ax1_twin.tick_params(axis='y', labelcolor='k')
 
-        rhs_n = nabla_n - div_un + drift_n - chi0 * div_n_gradc
-        rhs_c = alpha * nabla_c - div_uc - beta * (n * c) + beta * c
+line2 = ax2_twin.plot(time_vec, rhoD, 'r', linewidth=1.4, label='$\\rho_d$')
+ax2_twin.set_ylabel('Defect density $\\rho_d$', color='r')
+ax2_twin.tick_params(axis='y', labelcolor='r')
 
-        if dealise:
-            rhs_n_hat = np.fft.fft2(rhs_n) * dealias_mask
-            rhs_c_hat = np.fft.fft2(rhs_c) * dealias_mask
-        else:
-            rhs_n_hat = np.fft.fft2(rhs_n)
-            rhs_c_hat = np.fft.fft2(rhs_c)
+ax.set_xlabel('Time')
+ax.set_title('$E_k(t)$ and defect density $\\rho_d(t)$')
+ax.grid(True, alpha=0.3)
+fig1.tight_layout()
 
-        N_hat_new = (N_hat + dt * rhs_n_hat) / den_n
-        C_hat_new = (C_hat + dt * rhs_c_hat) / den_c
+# 2) Scatter: E_k vs rho_d
+fig2, ax = plt.subplots(figsize=(10, 6), facecolor='w')
+scatter = ax.scatter(rhoD, Ek_time, s=18, c=time_vec, cmap='viridis')
+ax.set_xlabel('Defect density $\\rho_d$')
+ax.set_ylabel('Kinetic energy $E_k$')
+ax.set_title('Scatter: $E_k$ vs $\\rho_d$ (colored by time)')
+cbar = plt.colorbar(scatter, ax=ax)
+cbar.set_label('Time')
+ax.grid(True, alpha=0.3)
+fig2.tight_layout()
 
-        if dealise:
-            N_hat_new *= dealias_mask
-            C_hat_new *= dealias_mask
+# 3) Pearson correlation coefficient
+R = np.corrcoef(Ek_time, rhoD)
+print(f'Pearson corr(E_k, rho_d) = {R[0, 1]:.3f}')
 
-        n = np.real(np.fft.ifft2(N_hat_new))
-        c = np.real(np.fft.ifft2(C_hat_new))
+# 4) Lagged cross-correlation
+maxLagTime = 5  # physical time units
+maxLag = int(np.round(maxLagTime / dt))
+C, lags = xcorr_coeff(Ek_time, rhoD, maxLag)
 
-        if clip_n_neg:
-            n = np.maximum(n, 0)
+fig3, ax = plt.subplots(figsize=(10, 6), facecolor='w')
+ax.plot(lags * dt, C, linewidth=1.5)
+ax.set_xlabel('Time lag')
+ax.set_ylabel('Cross-correlation (coeff)')
+ax.set_title('Lagged cross-correlation: $E_k$ vs $\\rho_d$')
+ax.grid(True, alpha=0.3)
+fig3.tight_layout()
 
-        if step % plot_every == 0 or step == 1 or step == n_steps:
-            frame_count += 1
-            t_now = step * dt
-
-            h_n.set_data(n)
-            ax1.set_title(f"n(x,y,t),  t = {t_now:.2f}")
-            q4.set_UVC(u[::quiver_sub, ::quiver_sub], v[::quiver_sub, ::quiver_sub])
-
-            h_c.set_data(c)
-            ax2.set_title(f"c(x,y,t),  t = {t_now:.2f}")
-
-            vx = np.real(np.fft.ifft2(1j * KX * np.fft.fft2(v)))
-            uy = np.real(np.fft.ifft2(1j * KY * np.fft.fft2(u)))
-            ux = np.real(np.fft.ifft2(1j * KX * np.fft.fft2(u)))
-            vy = np.real(np.fft.ifft2(1j * KY * np.fft.fft2(v)))
-            vort = vx - uy
-
-            theta_field = np.mod(np.arctan2(v, u), np.pi)
-            x_def, y_def, q_def = detect_winding_defects(theta_field, x, y)
-
-            tracks, next_track_id = update_defect_tracks(
-                tracks,
-                next_track_id,
-                x_def,
-                y_def,
-                q_def,
-                t_now,
-                frame_count,
-                track_max_dist,
-                track_max_gap,
-            )
-
-            vmax = np.max(np.abs(vort))
-            if vmax > 0:
-                h_vort.set_clim(-vmax, vmax)
-
-            h_vort.set_data(vort)
-            ax3.set_title(f"W(x,y,t), t = {t_now:.2f}")
-            q3.set_UVC(u[::quiver_sub, ::quiver_sub], v[::quiver_sub, ::quiver_sub])
-
-            h_theta.set_data(theta_field)
-            ax4.set_title(f"Director field + defects,  t = {t_now:.2f}")
-            theta_sub = theta_field[::quiver_sub, ::quiver_sub]
-            q.set_UVC(np.cos(theta_sub), np.sin(theta_sub))
-
-            pos_mask = q_def > 0
-            neg_mask = q_def < 0
-            h_plus.set_offsets(np.column_stack((x_def[pos_mask], y_def[pos_mask])) if np.any(pos_mask) else np.empty((0, 2)))
-            h_minus.set_offsets(np.column_stack((x_def[neg_mask], y_def[neg_mask])) if np.any(neg_mask) else np.empty((0, 2)))
-
-            for handle in track_line_handles:
-                handle.remove()
-            track_line_handles = []
-
-            for tr in tracks:
-                if len(tr["x"]) > 1:
-                    line_color = (1, 0, 0) if tr["sign"] > 0 else (0, 0.7, 0.9)
-                    (line,) = ax4.plot(tr["x"], tr["y"], "-", color=line_color, linewidth=1.2)
-                    track_line_handles.append(line)
-
-            plt.pause(0.001)
-
-    return tracks
-
-
-if __name__ == "__main__":
-    defectTracks = run_simulation()
+plt.show()
