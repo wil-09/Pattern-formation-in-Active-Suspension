@@ -1,0 +1,53 @@
+name: Run Python scripts
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run GR2D.py
+        env:
+          MPLBACKEND: Agg
+        run: python GR2D.py
+
+      - name: Validate defects.py
+        env:
+          MPLBACKEND: Agg
+        run: |
+          python - <<'EOF'
+          import defects
+          import numpy as np
+
+          # Smoke-test individual functions with small inputs
+          x = np.linspace(0, 1, 10)
+          y = np.linspace(0, 1, 10)
+          theta = np.random.default_rng(0).random((10, 10))
+          x_def, y_def, q_def = defects.detect_winding_defects(theta, x, y)
+          print(f"detect_winding_defects: found {len(x_def)} defect(s)")
+          tracks, next_id = defects.update_defect_tracks([], 1, x_def, y_def, q_def, 0.0, 0, 2.0, 2)
+          print(f"update_defect_tracks: {len(tracks)} track(s)")
+          print("defects.py validation passed")
+          EOF
